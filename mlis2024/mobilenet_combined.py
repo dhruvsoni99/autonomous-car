@@ -22,6 +22,13 @@ from tensorflow.keras.callbacks import TensorBoard
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+from functools import partial
+import tensorflow as tf
+import keras.backend as K
 
 print( f'tf.__version__: {tf.__version__}' )
 print( f'keras.__version__: {keras.__version__}' )
@@ -48,15 +55,10 @@ def my_imread(image_path):
 def img_preprocess(image, label):
 
     image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)  
-    image = cv2.GaussianBlur(image, (3,3), 0)
-    image = cv2.resize(image, (192,192)) 
-
-    # DATA AUGMENTATION -> IMAGE FLIP
-    if random.random() < 0.5:
-        image = cv2.flip(image, 1)
-        label = 1 - label
-
-    return image, label
+    image = cv2.resize(image, (192,192))
+    im = tf.image.convert_image_dtype(image, tf.float32) 
+    
+    return im, label
 
 
 def image_data_generator(image_paths, labels_dict, batch_size):
@@ -90,35 +92,43 @@ def image_data_generator(image_paths, labels_dict, batch_size):
 
 def mobile_net_classification_model():
     inputs = Input(shape=(192, 192, 3))
-    x = tf.keras.layers.Rescaling(1./127.5, offset=-1)(inputs)
     
-    base_model = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet", input_tensor=x)
+    # data augmentation -> random brightness and contrast
+    data_augmentation = tf.keras.Sequential([tf.keras.layers.RandomBrightness(0.1, seed=123),
+                                             tf.keras.layers.RandomContrast(0.1, seed=123),
+
+    ])
+
+    # mobilenetv2 base model
+    base_model = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet", input_tensor=inputs)
     base_model.trainable = False
+    
+    aug_inputs = data_augmentation(inputs)
 
-    x = GlobalAveragePooling2D()(base_model.output)
-
-    common = Dense(1024, activation='relu')(x)
-    common = Dropout(0.5)(common)
+    x = base_model(aug_inputs, training=False)
+    
+    # global average pooling
+    x = GlobalAveragePooling2D()(x)
+    
+    # 52 unit dense layer
+    x = Dense(52, activation='relu')(x)
+    
+    # 30% dropout rate
+    x = Dropout(0.3)(x)
 
     # angle prediction
-    angle_branch = Dense(512, activation='relu')(common)
-    angle_branch = tf.keras.layers.BatchNormalization()(angle_branch)
-    angle_branch = Dropout(0.5)(angle_branch)
-    angle_output = Dense(17, activation='softmax', name='angle_output')(angle_branch)
+    angle_output = Dense(17, activation='softmax', name='angle_output')(x)
 
     # speed prediction
-    speed_branch = Dense(512, activation='relu')(common)
-    speed_branch = Dropout(0.5)(speed_branch)
-    speed_output = Dense(1, activation='sigmoid', name='speed_output')(common) 
-
+    speed_output = Dense(1, activation='sigmoid', name='speed_output')(x) 
 
     model = Model(inputs=inputs, outputs=[angle_output, speed_output])
    
-    # learning rate
+    # higher learning rate for initial training
     custom_lr = 0.001  
-    optimizer = RMSprop(learning_rate=custom_lr)
+    optimizer = Adam(learning_rate=custom_lr)
 
-    model.compile(optimizer='adam',
+    model.compile(optimizer=optimizer,
                   loss={'angle_output': 'categorical_crossentropy', 'speed_output': 'binary_crossentropy'},
                   metrics={'angle_output': 'accuracy', 'speed_output': 'accuracy'})
 
@@ -151,6 +161,8 @@ data_dir = 'training_data/training_data'
 norm_csv_path = 'training_norm.csv'
 cleaned_df = get_merged_df(data_dir, norm_csv_path)
 
+print(cleaned_df)
+
 angle_labels = cleaned_df['angle'].to_list()
 speed_labels = cleaned_df['speed'].to_list()
 image_paths = cleaned_df['image_path'].to_list()
@@ -161,7 +173,7 @@ model = mobile_net_classification_model()
 
 print(model.summary())
 
-model_output_dir = '/home/psysm13/GOAT-3/autopilot/models/'  
+model_output_dir = 'inpersonmodels/'  
 
 # clean up log folder for tensorboard
 log_dir_root = f'{model_output_dir}/logs'
@@ -169,7 +181,7 @@ log_dir_root = f'{model_output_dir}/logs'
 tensorboard_callback = TensorBoard(log_dir_root, histogram_freq=1)
 
 # path to save model
-tfmodelpath = '/home/psysm13/GOAT-3/autopilot/models/404_Driver_Not_Found/combinedmodel_best/'
+tfmodelpath = '/home/psysm13/GOAT-3/autopilot/models/two_epoch_mobilenet/mobilenetearly/'
 
 # early stopping in case the val loss does not improve
 early_stopping = EarlyStopping(
@@ -189,7 +201,9 @@ model_checkpoint_callback = ModelCheckpoint(
     mode='min',             
     save_freq='epoch',
     save_format='tf'      
-    )
+    ) 
+
+print(model.summary())
 
 history = model.fit(
     image_data_generator(X_train, {'angle_output': angle_train, 'speed_output': speed_train}, batch_size=128),
@@ -201,13 +215,14 @@ history = model.fit(
     callbacks=[early_stopping, model_checkpoint_callback, tensorboard_callback]
     )
 
-optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.00001) 
-
 # unfreeze top layers
 for layer in model.layers[-20:]:
     layer.trainable = True
 
-model.compile(optimizer='adam',
+fine_tuning_learning_rate = 0.0001  
+fine_tune_optimizer = Adam(learning_rate=fine_tuning_learning_rate)
+
+model.compile(optimizer= fine_tune_optimizer,
     loss={'angle_output': 'categorical_crossentropy', 'speed_output': 'binary_crossentropy'},
     metrics={'angle_output': 'accuracy', 'speed_output': 'accuracy'})
 
@@ -216,10 +231,10 @@ history_fine = model.fit(
     image_data_generator(X_train, {'angle_output': angle_train, 'speed_output': speed_train}, batch_size=128),
     steps_per_epoch=len(X_train) // 128,
     epochs=10,  
-    validation_data=image_data_generator(X_valid, {'angle_output': angle_valid, 'speed_output': speed_valid}, batch_size=128),
+    validation_data = image_data_generator(X_valid, {'angle_output': angle_valid, 'speed_output': speed_valid}, batch_size=128),
     validation_steps=len(X_valid) // 128,
     verbose=1,
-    callbacks=[model_checkpoint_callback]  
+    callbacks=[model_checkpoint_callback]
     )
 
-model.save('/home/psysm13/GOAT-3/autopilot/models/404_Driver_Not_Found/combinedmodel/', save_format='tf')
+model.save('/home/psysm13/GOAT-3/autopilot/models/two_epoch_mobilenet/finalmodel_resc_noflip/', save_format='tf')
